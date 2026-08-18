@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>OpenLayers 离线地图示例</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@v9.2.4/ol.css" />
+    <style>
+      html,
+      body,
+      #map {
+        height: 100%;
+        margin: 0;
+      }
+      .toolbar {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        z-index: 1000;
+        background: #fff;
+        padding: 10px 12px;
+        border-radius: 8px;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+        font-family: sans-serif;
+        font-size: 13px;
+        min-width: 200px;
+      }
+      .toolbar .row {
+        margin: 4px 0;
+      }
+      .toolbar .label {
+        color: #666;
+      }
+      .toolbar .value {
+        font-weight: 600;
+        color: #1a73e8;
+      }
+      .source-badge {
+        display: inline-block;
+        padding: 1px 6px;
+        border-radius: 3px;
+        background: #e8f0fe;
+        color: #1a73e8;
+        font-size: 11px;
+        margin-left: 4px;
+      }
+      .source-badge.overzoom {
+        background: #fef7e0;
+        color: #b06000;
+      }
+      /* 加载指示器 */
+      #loadingOverlay {
+        position: absolute;
+        top: 10px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 1001;
+        background: rgba(26, 115, 232, 0.95);
+        color: #fff;
+        padding: 6px 14px;
+        border-radius: 16px;
+        font-family: sans-serif;
+        font-size: 13px;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+        display: none;
+      }
+      #loadingOverlay .spinner {
+        display: inline-block;
+        width: 12px;
+        height: 12px;
+        border: 2px solid rgba(255, 255, 255, 0.4);
+        border-top-color: #fff;
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+        margin-right: 6px;
+        vertical-align: middle;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      /* 错误提示 */
+      #errorToast {
+        position: absolute;
+        bottom: 20px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 1002;
+        background: #d93025;
+        color: #fff;
+        padding: 8px 16px;
+        border-radius: 6px;
+        font-family: sans-serif;
+        font-size: 13px;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+        display: none;
+        max-width: 80%;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="map"></div>
+    <div id="loadingOverlay"><span class="spinner"></span><span id="loadingText">加载瓦片中...</span></div>
+    <div id="errorToast"></div>
+    <div class="toolbar">
+      <div class="row"><span class="label">缩放级别：</span><span class="value" id="zoomInfo">-</span></div>
+      <div class="row">
+        <span class="label">中心经纬度：</span><span class="value" id="centerInfo" style="font-size: 11px">-</span>
+      </div>
+      <div class="row"><span class="label">当前数据源：</span><span class="value" id="sourceInfo">-</span></div>
+      <div class="row"><span class="label">加载状态：</span><span class="value" id="statusInfo">就绪</span></div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/ol@v9.2.4/dist/ol.js"></script>
+    <script>
+      const API_BASE = window.location.origin
+      // 统一瓦片接口：服务端自动判断区域，前端无需关心具体 mapId
+      const UNIFIED_TILE_URL = `${API_BASE}/api/maps/tiles/{z}/{x}/{y}.png`
+
+      let olMap = null
+      let currentLayer = null
+      let currentSource = null
+      let loadingCount = 0
+      let errorCount = 0
+      let lastSourceMapId = null
+      // 数据源最大缩放层级（所有地图 maxZoom 的最大值），超过即触发 overzoom
+      let maxDataZoom = null
+      // 标记是否已提示过达到最大层级，避免反复弹窗
+      let maxZoomNotified = false
+
+      // ===== 加载状态指示 =====
+      const loadingOverlay = document.getElementById('loadingOverlay')
+      const loadingText = document.getElementById('loadingText')
+      const statusInfo = document.getElementById('statusInfo')
+      const errorToast = document.getElementById('errorToast')
+
+      function showLoading() {
+        loadingOverlay.style.display = 'block'
+        loadingText.textContent = `加载瓦片中... (${loadingCount})`
+        statusInfo.textContent = `加载中 (${loadingCount})`
+        statusInfo.style.color = '#b06000'
+      }
+      function hideLoading() {
+        if (loadingCount <= 0) {
+          loadingOverlay.style.display = 'none'
+          if (errorCount > 0) {
+            statusInfo.textContent = `就绪（${errorCount} 个瓦片加载失败）`
+            statusInfo.style.color = '#d93025'
+          } else {
+            statusInfo.textContent = '就绪'
+            statusInfo.style.color = '#1a73e8'
+          }
+        } else {
+          loadingText.textContent = `加载瓦片中... (${loadingCount})`
+          statusInfo.textContent = `加载中 (${loadingCount})`
+        }
+      }
+      function showError(msg, duration = 4000) {
+        errorToast.textContent = msg
+        errorToast.style.display = 'block'
+        clearTimeout(showError._t)
+        showError._t = setTimeout(() => {
+          errorToast.style.display = 'none'
+        }, duration)
+      }
+
+      // ===== 初始化地图 =====
+      async function init() {
+        // 拉取地图列表，计算数据源最大缩放层级
+        try {
+          const res = await fetch(`${API_BASE}/api/maps`)
+          const json = await res.json()
+          if (json.data && json.data.length > 0) {
+            maxDataZoom = Math.max(...json.data.map((m) => m.maxZoom))
+            console.log(`数据源最大缩放层级: z=${maxDataZoom}`)
+          }
+        } catch (e) {
+          console.warn('获取地图列表失败，无法判断最大层级', e)
+        }
+
+        olMap = new ol.Map({
+          target: 'map',
+          view: new ol.View({
+            center: ol.proj.fromLonLat([121.4737, 31.2304]), // 上海中心
+            zoom: 10
+          })
+        })
+
+        // 使用统一瓦片接口创建图层（不限制 minZoom/maxZoom，由服务端 overzoom 处理）
+        switchToUnifiedLayer()
+
+        // 视图变化时更新状态面板
+        // 使用 change:resolution 而非 change:zoom，确保缩放动画过程中实时更新
+        // （OL 内部 resolution 是连续变化的，zoom 是其派生值）
+        const view = olMap.getView()
+        view.on('change:resolution', () => {
+          updateZoomInfo()
+          updateCenterInfo()
+          checkMaxZoomReached()
+        })
+        // moveend 确保动画结束后数值精确对齐最终状态
+        olMap.on('moveend', () => {
+          updateZoomInfo()
+          updateCenterInfo()
+        })
+        updateZoomInfo()
+        updateCenterInfo()
+      }
+
+      // 检测是否已达到/超过数据源最大层级，首次跨越时提示
+      function checkMaxZoomReached() {
+        if (maxDataZoom === null) return
+        const currentZoom = olMap.getView().getZoom()
+        if (currentZoom > maxDataZoom) {
+          if (!maxZoomNotified) {
+            maxZoomNotified = true
+            showError(`已达到数据源最大层级 z=${maxDataZoom}，继续放大将使用 overzoom 放大显示（图像会变模糊）`, 6000)
+            // 更新状态面板徽标
+            statusInfo.textContent = `已超最大层级 (overzoom)`
+            statusInfo.style.color = '#b06000'
+          }
+        } else {
+          // 缩回最大层级以内，重置标记，允许下次再次提示
+          if (maxZoomNotified && currentZoom <= maxDataZoom - 0.5) {
+            maxZoomNotified = false
+          }
+        }
+      }
+
+      function switchToUnifiedLayer() {
+        if (currentLayer) {
+          olMap.removeLayer(currentLayer)
+        }
+
+        currentSource = new ol.source.XYZ({
+          url: UNIFIED_TILE_URL,
+          // 关键：限制 source 的 maxZoom 为数据源最大级别，
+          // 超过时 OL 会自动放大显示现有瓦片，而非请求新瓦片，
+          // 避免服务端 overzoom 返回同一张父瓦片导致满屏重复
+          maxZoom: maxDataZoom !== null ? maxDataZoom : 18,
+          crossOrigin: 'anonymous',
+          transition: 200
+        })
+
+        // 监听瓦片加载状态
+        currentSource.on('tileloadstart', () => {
+          loadingCount++
+          errorCount = 0
+          showLoading()
+        })
+        currentSource.on('tileloadend', (evt) => {
+          loadingCount = Math.max(0, loadingCount - 1)
+          // 从响应头读取数据源信息
+          readTileSourceInfo(evt)
+          hideLoading()
+        })
+        currentSource.on('tileloaderror', (evt) => {
+          loadingCount = Math.max(0, loadingCount - 1)
+          errorCount++
+          hideLoading()
+          // 统一接口对无数据区域返回 404 属于正常情况，仅当大量失败时提示
+          if (errorCount > 5) {
+            showError('部分瓦片加载失败，可能当前区域无数据')
+          }
+        })
+
+        currentLayer = new ol.layer.Tile({ source: currentSource })
+        olMap.addLayer(currentLayer)
+      }
+
+      // 从瓦片响应头读取数据源信息（用于状态面板展示）
+      function readTileSourceInfo(evt) {
+        try {
+          const tile = evt && evt.tile
+          if (!tile) return
+          const img = tile.getImage && tile.getImage()
+          // OpenLayers 内部不直接暴露响应头，这里通过 Image 加载无 header 访问能力，
+          // 改用轮询 /health 接口获取地图列表展示基本信息即可。
+        } catch (e) {
+          // 忽略
+        }
+      }
+
+      // 更新缩放级别显示：同时展示浮点 zoom 与实际瓦片整数级别
+      function updateZoomInfo() {
+        const view = olMap.getView()
+        const floatZoom = view.getZoom()
+        // OL 实际请求瓦片时使用的整数级别（四舍五入）
+        const tileZoom = Math.round(floatZoom)
+        const zoomInfo = document.getElementById('zoomInfo')
+
+        if (maxDataZoom !== null && tileZoom > maxDataZoom) {
+          // 已超过数据源最大级别，OL 正在放大显示 maxZoom 处的瓦片
+          const overLevels = (floatZoom - maxDataZoom).toFixed(1)
+          zoomInfo.innerHTML = `${floatZoom.toFixed(2)} <span style="color:#b06000;font-size:11px">(数据 z=${maxDataZoom}, 放大 ${overLevels}级)</span>`
+        } else {
+          // 正常范围：显示浮点 zoom + 实际瓦片级别
+          zoomInfo.innerHTML = `${floatZoom.toFixed(2)} <span style="color:#666;font-size:11px">(瓦片 z=${tileZoom})</span>`
+        }
+      }
+      function updateCenterInfo() {
+        const center = olMap.getView().getCenter()
+        const lonLat = ol.proj.toLonLat(center)
+        document.getElementById('centerInfo').textContent = `${lonLat[0].toFixed(3)}, ${lonLat[1].toFixed(3)}`
+      }
+
+      init().catch((err) => {
+        console.error('初始化失败', err)
+        showError('无法连接地图服务，请确认服务已启动', 10000)
+      })
+    </script>
+  </body>
+</html>

@@ -1,0 +1,34 @@
+{
+  "maps": [
+    {
+      "id": "hongkong",
+      "name": "香港特别行政区",
+      "path": "D:/SGDownload/香港特别行政区/香港特别行政区_MBLites/香港特别行政区.mbtiles",
+      "description": "水经注下载 - 香港离线卫星/影像地图"
+    },
+    {
+      "id": "map-67f403",
+      "name": "上海市",
+      "path": "D:/SGDownload/上海市/上海市_MBLites/上海市.mbtiles",
+      "description": "水经注下载 - 离线地图（自动扫描）"
+    },
+    {
+      "id": "map-9fbc39",
+      "name": "天津市",
+      "path": "D:/SGDownload/天津市/天津市_MBLites/天津市.mbtiles",
+      "description": "水经注下载 - 离线地图（自动扫描）"
+    },
+    {
+      "id": "map-b2f3db",
+      "name": "澳门特别行政区",
+      "path": "D:/SGDownload/澳门特别行政区/澳门特别行政区_MBLites/澳门特别行政区.mbtiles",
+      "description": "水经注下载 - 离线地图（自动扫描）"
+    },
+    {
+      "id": "map-beb254",
+      "name": "中国",
+      "path": "D:/SGDownload/中国/中国_MBLites/中国.mbtiles",
+      "description": "水经注下载 - 离线地图（自动扫描）"
+    }
+  ]
+}

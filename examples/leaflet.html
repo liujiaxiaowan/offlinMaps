@@ -1,0 +1,110 @@
+<!--
+ * @Author: xiaowu xiaowu@tianmagroup.com
+ * @Date: 2026-08-14 14:44:16
+ * @LastEditors: xiaowu xiaowu@tianmagroup.com
+ * @LastEditTime: 2026-08-18 10:51:52
+ * @FilePath: \offlineMaps\examples\leaflet.html
+ * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+-->
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Leaflet 离线地图示例</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+      html,
+      body,
+      #map {
+        height: 100%;
+        margin: 0;
+      }
+      .toolbar {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        z-index: 1000;
+        background: #fff;
+        padding: 10px 12px;
+        border-radius: 8px;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+        font-family: sans-serif;
+      }
+      select {
+        min-width: 180px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="map"></div>
+    <div class="toolbar">
+      <label for="mapSelect">选择地图：</label>
+      <select id="mapSelect"></select>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+      const API_BASE = window.location.origin
+
+      const map = L.map('map', {
+        center: [22.3, 113.9],
+        zoom: 11,
+        minZoom: 2,
+        maxZoom: 17
+      })
+
+      let currentLayer = null
+
+      async function loadMapList() {
+        const res = await fetch(`${API_BASE}/api/maps`)
+       
+        const json = await res.json()
+         console.log('resresre', json)
+        const select = document.getElementById('mapSelect')
+
+        json.data.forEach((item, index) => {
+          const option = document.createElement('option')
+          option.value = item.id
+          option.textContent = item.name
+          select.appendChild(option)
+          if (index === 0) switchMap(item)
+        })
+
+        select.addEventListener('change', async (e) => {
+          const mapMeta = json.data.find((m) => m.id === e.target.value)
+          switchMap(mapMeta)
+        })
+      }
+
+      function switchMap(mapMeta) {
+        if (currentLayer) {
+          map.removeLayer(currentLayer)
+        }
+
+        const tileUrl = `${API_BASE}/api/maps/${mapMeta.id}/tiles/{z}/{x}/{y}.${mapMeta.format || 'png'}`
+
+        currentLayer = L.tileLayer(tileUrl, {
+          minZoom: mapMeta.minZoom,
+          maxZoom: mapMeta.maxZoom,
+          attribution: mapMeta.name
+        }).addTo(map)
+
+        if (mapMeta.bounds) {
+          const { south, west, north, east } = mapMeta.bounds
+          map.fitBounds([
+            [south, west],
+            [north, east]
+          ])
+        } else if (mapMeta.center) {
+          map.setView([mapMeta.center.lat, mapMeta.center.lon], mapMeta.center.zoom || 12)
+        }
+      }
+
+      loadMapList().catch((err) => {
+        console.error('加载地图列表失败', err)
+        alert('无法连接地图服务，请确认服务已启动')
+      })
+    </script>
+  </body>
+</html>
