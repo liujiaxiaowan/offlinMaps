@@ -1,33 +1,143 @@
 {
   "maps": [
     {
+      "id": "map-971f3cd08972",
+      "name": "全球",
+      "path": "D:/SGDownload/全球/全球_MBLites/全球.mbtiles",
+      "description": "水经注下载 - 离线地图（自动扫描）",
+      "bounds": {
+        "west": -180,
+        "south": -86.1328125,
+        "east": 180,
+        "north": 90
+      },
+      "center": {
+        "lon": 105,
+        "lat": 35,
+        "zoom": 2
+      },
+      "minZoom": 1,
+      "maxZoom": 5
+    },
+    {
+      "id": "map-beb254cbc2dd",
+      "name": "中国",
+      "path": "D:/SGDownload/中国/中国_MBLites/中国.mbtiles",
+      "description": "水经注下载 - 离线地图（自动扫描）",
+      "bounds": {
+        "west": 73.497551,
+        "south": 3.593695,
+        "east": 135.103684,
+        "north": 53.568958
+      },
+      "center": {
+        "lon": 104.3006575,
+        "lat": 28.5813265,
+        "zoom": 4
+      },
+      "minZoom": 1,
+      "maxZoom": 9,
+      "tileOffsetX": 2
+    },
+    {
+      "id": "map-67f4036cacd9",
+      "name": "上海市",
+      "path": "D:/SGDownload/上海市/上海市_MBLites/上海市.mbtiles",
+      "description": "水经注下载 - 离线地图（自动扫描）",
+      "bounds": {
+        "west": 120.85262,
+        "south": 30.67779,
+        "east": 122.242918,
+        "north": 31.874625
+      },
+      "center": {
+        "lon": 121.547769,
+        "lat": 31.276208,
+        "zoom": 9
+      },
+      "minZoom": 2,
+      "maxZoom": 17
+    },
+    {
+      "id": "map-9fbc39a14709",
+      "name": "天津市",
+      "path": "D:/SGDownload/天津市/天津市_MBLites/天津市.mbtiles",
+      "description": "水经注下载 - 离线地图（自动扫描）",
+      "bounds": {
+        "west": 116.702128,
+        "south": 38.554815,
+        "east": 118.059217,
+        "north": 40.25179
+      },
+      "center": {
+        "lon": 117.380672,
+        "lat": 39.403303,
+        "zoom": 9
+      },
+      "minZoom": 2,
+      "maxZoom": 15
+    },
+    {
+      "id": "map-840b58068ff0",
+      "name": "江苏省",
+      "path": "D:/SGDownload/江苏省/江苏省_MBLites/江苏省.mbtiles",
+      "description": "水经注下载 - 离线地图（自动扫描）",
+      "bounds": {
+        "west": 116.356344,
+        "south": 30.760149,
+        "east": 121.970943,
+        "north": 35.141739
+      },
+      "center": {
+        "lon": 119.163643,
+        "lat": 32.950944,
+        "zoom": 7
+      },
+      "minZoom": 2,
+      "maxZoom": 13
+    },
+    {
       "id": "hongkong",
       "name": "香港特别行政区",
       "path": "D:/SGDownload/香港特别行政区/香港特别行政区_MBLites/香港特别行政区.mbtiles",
-      "description": "水经注下载 - 香港离线卫星/影像地图"
+      "description": "水经注下载 - 香港离线卫星/影像地图",
+      "bounds": {
+        "west": 113.834898,
+        "south": 22.154044,
+        "east": 114.44239,
+        "north": 22.561917
+      },
+      "center": {
+        "lon": 114.138644,
+        "lat": 22.357981,
+        "zoom": 11
+      },
+      "minZoom": 2,
+      "maxZoom": 17
     },
     {
-      "id": "map-67f403",
-      "name": "上海市",
-      "path": "D:/SGDownload/上海市/上海市_MBLites/上海市.mbtiles",
-      "description": "水经注下载 - 离线地图（自动扫描）"
-    },
-    {
-      "id": "map-9fbc39",
-      "name": "天津市",
-      "path": "D:/SGDownload/天津市/天津市_MBLites/天津市.mbtiles",
-      "description": "水经注下载 - 离线地图（自动扫描）"
-    },
-    {
-      "id": "map-b2f3db",
+      "id": "map-b2f3db5ea17e",
       "name": "澳门特别行政区",
       "path": "D:/SGDownload/澳门特别行政区/澳门特别行政区_MBLites/澳门特别行政区.mbtiles",
-      "description": "水经注下载 - 离线地图（自动扫描）"
+      "description": "水经注下载 - 离线地图（自动扫描）",
+      "bounds": {
+        "west": 113.528181,
+        "south": 22.10915,
+        "east": 113.598862,
+        "north": 22.217043
+      },
+      "center": {
+        "lon": 113.563522,
+        "lat": 22.163097,
+        "zoom": 13
+      },
+      "minZoom": 4,
+      "maxZoom": 17
     },
     {
-      "id": "map-beb254",
-      "name": "中国",
-      "path": "D:/SGDownload/中国/中国_MBLites/中国.mbtiles",
+      "id": "map-3c68bd3e362b",
+      "name": "浙江省",
+      "path": "D:/SGDownload/浙江省/浙江省_MBLites/浙江省.mbtiles",
       "description": "水经注下载 - 离线地图（自动扫描）"
     }
   ]

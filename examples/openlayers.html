@@ -12,6 +12,12 @@
         height: 100%;
         margin: 0;
       }
+      /* 地图容器背景色：无数据区域显示淡灰蓝而非纯白，减少视觉突兀 */
+      #map,
+      .ol-viewport,
+      .ol-layer canvas {
+        background-color: #e8eaed;
+      }
       .toolbar {
         position: absolute;
         top: 10px;
@@ -43,10 +49,6 @@
         color: #1a73e8;
         font-size: 11px;
         margin-left: 4px;
-      }
-      .source-badge.overzoom {
-        background: #fef7e0;
-        color: #b06000;
       }
       /* 加载指示器 */
       #loadingOverlay {
@@ -108,6 +110,9 @@
       <div class="row">
         <span class="label">中心经纬度：</span><span class="value" id="centerInfo" style="font-size: 11px">-</span>
       </div>
+      <div class="row">
+        <span class="label">所在区域：</span><span class="value" id="regionInfo" style="font-size: 11px">-</span>
+      </div>
       <div class="row"><span class="label">当前数据源：</span><span class="value" id="sourceInfo">-</span></div>
       <div class="row"><span class="label">加载状态：</span><span class="value" id="statusInfo">就绪</span></div>
     </div>
@@ -116,18 +121,51 @@
     <script>
       const API_BASE = window.location.origin
       // 统一瓦片接口：服务端自动判断区域，前端无需关心具体 mapId
-      const UNIFIED_TILE_URL = `${API_BASE}/api/maps/tiles/{z}/{x}/{y}.png`
+      // ?v=3 为缓存版本号：同一 URL 的返回内容会随服务端数据源选择逻辑变化，
+      // 通过版本号兜底绕过浏览器对旧瓦片（max-age 长期缓存）的命中
+      // v=3：服务端移除 overzoom（超出层级的瓦片改由前端客户端裁剪放大），需跳过旧缓存
+      // v=7：opacity 过渡区收窄 + base 层动态隐藏消除重影，需跳过旧缓存
+      // v=8：服务端矫正中国地图瓦片 +2 列内容偏移，同 URL 返回内容已变化，需跳过旧缓存
+      const UNIFIED_TILE_URL = `${API_BASE}/api/maps/tiles/{z}/{x}/{y}.png?v=8`
 
       let olMap = null
       let currentLayer = null
       let currentSource = null
+      // 双层架构：底图层（全球低层级）+ 详情层（区域高层级）
+      let baseLayer = null
+      let baseSource = null
+      let detailLayer = null
+      let detailSource = null
       let loadingCount = 0
       let errorCount = 0
       let lastSourceMapId = null
-      // 数据源最大缩放层级（所有地图 maxZoom 的最大值），超过即触发 overzoom
+      // 数据源最大缩放层级（所有地图 maxZoom 的最大值），仅作 UI 参考
       let maxDataZoom = null
+      // 数据源最小缩放层级（所有地图 minZoom 的最小值），低于即可能进入全球视图
+      let minDataZoom = null
+      // 全球地图信息（用于低层级自动切换 + UI 提示）
+      let globalMap = null
+      // 国家级概览地图（非全球、覆盖最广的区域地图，如"中国"）
+      // 在省级层级基准计算中需排除（否则其低 maxZoom 会永远压低省级基准）
+      let nationalMap = null
+      // 底图层最大层级（全球地图 maxZoom），detail 层从 baseMaxZoom+1 开始
+      let baseMaxZoom = 5
+      // 区域地图列表（非全球、非空数据）：含国家级 + 省级/市级
+      let regionalMaps = []
+
+      // 计算地图 bounds 面积（经度跨度 × 纬度跨度），用于识别国家级（面积最大）
+      // 与 bounds 相交判定
+      function mapBoundsArea(m) {
+        if (!m || !m.bounds) return Infinity
+        return (m.bounds.east - m.bounds.west) * (m.bounds.north - m.bounds.south)
+      }
+      // 当前 detail 层生效的最大层级：随视图中心所在区域动态变化
+      // （如江苏区域=13、上海区域=17），超出后 OL 客户端放大当前图片（client-side overzoom）
+      let detailMaxZoom = null
       // 标记是否已提示过达到最大层级，避免反复弹窗
       let maxZoomNotified = false
+      // 标记是否已提示过进入全球视图
+      let globalViewNotified = false
 
       // ===== 加载状态指示 =====
       const loadingOverlay = document.getElementById('loadingOverlay')
@@ -167,28 +205,126 @@
 
       // ===== 初始化地图 =====
       async function init() {
-        // 拉取地图列表，计算数据源最大缩放层级
+        // ====== 【修复：init 幂等守卫】======
+        // 若 init() 被重复调用（用户框架 mounted 未清理、组件多次渲染、
+        // 脚本重复 append 到 DOM 等），先销毁旧 ol.Map 实例，
+        // 防止在同一个 #map 容器内堆叠多个 viewport → 多份地图像栅格一样并排显示。
+        if (olMap !== null) {
+          console.warn('[init] 检测到已有 ol.Map 实例，先销毁再重新创建')
+          try {
+            olMap.setTarget(null) // OL 官方销毁方式：detach target → 内部释放资源/控件/viewport
+          } catch (_) {
+            /* ignore */
+          }
+          olMap = null
+        }
+        // 同时重置所有与当前 map 强绑定的状态变量，避免 switchToUnifiedLayer
+        // 里拿旧引用 removeLayer 时与新 map 产生错位
+        baseLayer = null
+        detailLayer = null
+        baseSource = null
+        detailSource = null
+        detailMaxZoom = null
+        currentLayer = null
+        currentSource = null
+
+        // 拉取地图列表，计算数据源缩放层级范围与全球地图信息
         try {
           const res = await fetch(`${API_BASE}/api/maps`)
           const json = await res.json()
           if (json.data && json.data.length > 0) {
-            maxDataZoom = Math.max(...json.data.map((m) => m.maxZoom))
-            console.log(`数据源最大缩放层级: z=${maxDataZoom}`)
+            // 过滤空数据地图（tileCount=0 或 minZoom/maxZoom 为 null），
+            // 避免空地图（如空的中国/省级行政区 mbtiles）污染 maxDataZoom 计算与全球地图识别
+            const validMaps = json.data.filter(
+              (m) =>
+                m.tileCount > 0 &&
+                m.minZoom !== null &&
+                m.minZoom !== undefined &&
+                m.maxZoom !== null &&
+                m.maxZoom !== undefined
+            )
+            const skipped = json.data.filter((m) => !validMaps.includes(m))
+            if (skipped.length > 0) {
+              console.warn('跳过空数据地图:', skipped.map((m) => `${m.name}(id=${m.id})`).join(', '))
+            }
+            if (validMaps.length > 0) {
+              maxDataZoom = Math.max(...validMaps.map((m) => m.maxZoom))
+              minDataZoom = Math.min(...validMaps.map((m) => m.minZoom))
+              console.log(`有效数据源缩放层级范围: z=${minDataZoom} ~ z=${maxDataZoom}`)
+
+              // 识别全球地图：bounds 为空或经纬跨度满足全球范围
+              globalMap = validMaps.find((m) => {
+                if (!m.bounds) return true
+                const { west, south, east, north } = m.bounds
+                return east - west >= 350 && north - south >= 170
+              })
+              if (globalMap) {
+                baseMaxZoom = globalMap.maxZoom
+                console.log(
+                  `检测到全球地图: id=${globalMap.id}, name=${globalMap.name}, z=${globalMap.minZoom}~${globalMap.maxZoom}`
+                )
+              } else {
+                baseMaxZoom = Math.min(maxDataZoom, 5)
+                console.log('未检测到全球地图，低层级缩放将保持当前视图')
+              }
+
+              // 区域地图列表（非全球、非空）：包含国家级（中国）+ 省级/市级行政区
+              regionalMaps = validMaps.filter((m) => m !== globalMap)
+              // ===== 关键修复：从 regionalMaps 中识别"国家级概览地图" =====
+              // 逻辑与服务端 MBTilesManager.getNationalMap() 完全一致：
+              //   非全球、非空、bounds 面积最大者（覆盖最广，如"中国"）。
+              // 该地图 maxZoom 通常较低（中国 z≤9），若误计入"可视范围 min(maxZoom)"，
+              // 会把中国大陆视图的 detailMaxZoom 永远钉死在 9 → 省级 z10+ 瓦片永远不会被请求！
+              // 修复：省级统一基准计算时【排除国家级地图】；无省级相交时用国家级 maxZoom 兜底
+              //       （保证 z6–9 国家级概览瓦片仍正常请求）
+              let largestArea = -1
+              nationalMap = null
+              for (const m of regionalMaps) {
+                if (!m.bounds) continue
+                const area = mapBoundsArea(m)
+                if (area > largestArea) {
+                  largestArea = area
+                  nationalMap = m
+                }
+              }
+              window.nationalMap = nationalMap // 便于控制台调试
+              console.log(
+                nationalMap
+                  ? `识别到国家级概览地图: ${nationalMap.name} (z=${nationalMap.minZoom}~${nationalMap.maxZoom})，省级层级基准计算时将排除它`
+                  : '未识别到国家级概览地图（纯省级数据）'
+              )
+            }
           }
         } catch (e) {
-          console.warn('获取地图列表失败，无法判断最大层级', e)
+          console.warn('获取地图列表失败，无法判断缩放层级范围', e)
         }
 
+        // 支持 URL 定位参数（?lon=&lat=&zoom=）：便于分享视图链接与自动化验证
+        const urlPos = new URLSearchParams(window.location.search)
+        const initLon = parseFloat(urlPos.get('lon'))
+        const initLat = parseFloat(urlPos.get('lat'))
+        const initZoom = parseFloat(urlPos.get('zoom'))
         olMap = new ol.Map({
           target: 'map',
           view: new ol.View({
-            center: ol.proj.fromLonLat([121.4737, 31.2304]), // 上海中心
-            zoom: 10
+            // 中心设在中国中部，初始化显示全球图，放大后自动切换到中国地图
+            center: ol.proj.fromLonLat([
+              Number.isFinite(initLon) ? initLon : 105,
+              Number.isFinite(initLat) ? initLat : 35
+            ]),
+            // 初始 zoom=2，在全球地图 [1,5] 范围内，直接显示全球图
+            zoom: Number.isFinite(initZoom) ? initZoom : 2
           })
         })
 
-        // 使用统一瓦片接口创建图层（不限制 minZoom/maxZoom，由服务端 overzoom 处理）
+        // 使用统一瓦片接口创建图层（base 层全球低层级 + detail 层区域高层级，
+        // 超出层级由前端客户端放大当前图片，服务端不做 overzoom）
         switchToUnifiedLayer()
+
+        // 首帧渲染后重算层级基准：map 创建时 view size 尚未就绪（size=[0,0]），
+        // calculateExtent 无法得到真实可视范围 → 初始基准为乐观值 maxDataZoom（放行全部请求）。
+        // postrender 时 size 已知，降档修正到真实基准（降档不 refresh、已加载瓦片继续显示）
+        olMap.once('postrender', () => updateDetailMaxZoom())
 
         // 视图变化时更新状态面板
         // 使用 change:resolution 而非 change:zoom，确保缩放动画过程中实时更新
@@ -198,88 +334,649 @@
           updateZoomInfo()
           updateCenterInfo()
           checkMaxZoomReached()
+          checkGlobalView()
+          updateLayerOpacity()
+          // 缩放过程中同步判定区域最大层级（常驻 source 只更变量，升档时防抖 refresh），
+          // 使放大进入新区域时尽早加载该区域高清瓦片
+          updateDetailMaxZoom()
         })
-        // moveend 确保动画结束后数值精确对齐最终状态
+        // moveend 确保动画结束后数值精确对齐最终状态，并兜底触发区域最大层级判定
         olMap.on('moveend', () => {
           updateZoomInfo()
           updateCenterInfo()
+          updateDetailMaxZoom()
         })
+
+        // ===== 鼠标按下：识别所在区域 + 加载对应数据源 =====
+        // pointerdown（按下瞬间）：立即识别光标所在行政区并更新"所在区域"显示。
+        //   纯 DOM 更新无副作用——拖拽平移同样以按下开始，此处不触发任何视图动作。
+        // singleclick（按下且未拖拽即抬起）：加载该区域的数据源
+        //   （飞行到按下点并进入其数据接管层级，见 loadRegionDataSource）。
+        //   不直接在 pointerdown 里加载：无法预知按下是否会变成拖拽，
+        //   否则每次平移地图都会被强制缩放，拖拽功能将被破坏。
+        const isPrimaryButton = (evt) => {
+          const btn = evt.originalEvent && evt.originalEvent.button
+          return btn === undefined || btn === 0 // 左键/触摸；右键与中键不响应
+        }
+        olMap.on('pointerdown', (evt) => {
+          if (!isPrimaryButton(evt)) return
+          const [lon, lat] = ol.proj.toLonLat(evt.coordinate)
+          updateRegionInfo(lon, lat)
+        })
+        olMap.on('singleclick', (evt) => {
+          if (!isPrimaryButton(evt)) return
+          const [lon, lat] = ol.proj.toLonLat(evt.coordinate)
+          loadRegionDataSource(lon, lat)
+        })
+
         updateZoomInfo()
         updateCenterInfo()
+
+        // 暴露 olMap 到 window 便于调试与自动化测试
+        window.olMap = olMap
       }
 
-      // 检测是否已达到/超过数据源最大层级，首次跨越时提示
-      function checkMaxZoomReached() {
-        if (maxDataZoom === null) return
+      // 平滑过渡：根据当前 zoom 在 baseMaxZoom 边界附近渐变 detail 层透明度
+      // 渐变区间 [baseMaxZoom+0.5, baseMaxZoom+1]，共 0.5 级宽度：
+      //   - OL 按四舍五入请求瓦片：z5.0→z5 瓦片、z5.5→z6 瓦片
+      //   - detail 层 minZoom=baseMaxZoom+1(6)，z<5.5 时请求 z5 瓦片但 detail 无法提供 → 无内容
+      //   - 过渡起点对齐 z5.5（detail 首次有 z6 瓦片的时刻），避免"detail 空+base 拉伸"的无效叠加
+      //   - z < baseMaxZoom+0.5：detail 完全透明，只显示底图
+      //   - z > baseMaxZoom+1：detail 完全不透明，显示高清图
+      //   - base 层始终保持可见作为兜底：detail 层 404/ERROR 的区域先走祖先补载（z9 中国瓦片），
+      //     祖先也 404 时透出 base 层全球拉伸瓦片（模糊但非空白）。
+      //     不隐藏 base 层的原因：z10+ 时省级数据稀疏（上海 z10 仅 19 瓦片），
+      //     隐藏 base 层会导致 404 区域既无 detail 内容也无 base 兜底 → 大面积空白/割裂。
+      //     detail 层 opacity=1 时 200 瓦片自然覆盖 base 层，无重影。
+      function updateLayerOpacity() {
+        if (!detailLayer || !globalMap) return
         const currentZoom = olMap.getView().getZoom()
-        if (currentZoom > maxDataZoom) {
+        const fadeStart = baseMaxZoom + 0.5
+        const fadeEnd = baseMaxZoom + 1
+        let opacity
+        if (currentZoom <= fadeStart) {
+          opacity = 0
+        } else if (currentZoom >= fadeEnd) {
+          opacity = 1
+        } else {
+          const t = (currentZoom - fadeStart) / (fadeEnd - fadeStart)
+          opacity = t * t * (3 - 2 * t)
+        }
+        detailLayer.setVisible(opacity > 0)
+        detailLayer.setOpacity(opacity)
+      }
+
+      // ===== 可视范围（view-extent）层级判定 =====
+      // 需求 4：边界避免区域隔离——不按"中心点"选 maxZoom，而按"当前可视窗口与哪些区域相交"取 maxZoom 最小值。
+      // 例：可视范围同时覆盖上海（z17）和江苏（z13）→ 取 min(17,13)=13。
+      //   效果：整个可视窗口统一使用 z13（客户端统一拉伸到更高 zoom），所有瓦片视觉一致，
+      //         不会出现"上海半边 sharp z17、江苏半边 gap / ancestor z13 stretch"的隔离断层。
+      function getCurrentViewBounds() {
+        if (!olMap) return null
+        const size = olMap.getSize()
+        if (!size) return null
+        const view = olMap.getView()
+        const extent = view.calculateExtent(size)
+        if (!extent) return null
+        const [minx, miny, maxx, maxy] = extent
+        // WebMercator → WGS84 (lon/lat)
+        const sw = ol.proj.toLonLat([minx, miny])
+        const ne = ol.proj.toLonLat([maxx, maxy])
+        return { west: sw[0], south: sw[1], east: ne[0], north: ne[1] }
+      }
+
+      function boundsIntersect(a, b) {
+        // 标准轴对齐矩形相交判断：A 的西 ≤ B 的东 && A 的东 ≥ B 的西 && 南北同理
+        return a.west <= b.east && a.east >= b.west && a.south <= b.north && a.north >= b.south
+      }
+
+      // 取"当前可视窗口内【省级/市级】相交地图 maxZoom 的最小值"
+      // ===== 关键修复：EXCLUDE 国家级概览地图（如中国，maxZoom=9），否则其低 maxZoom 会永远压低结果 =====
+      //   （修复前 bug：任何中国大陆视图 min=9 → 省级 z10+ 瓦片永远不请求，放大到上海/江苏永远停在 z9 拉伸）
+      // 同时：无任何省级/市级相交时，若国家级覆盖视图 → 用国家级.maxZoom（保证 z6–9 国家级瓦片仍请求，
+      //       detail 层在过渡区间正常显示中国概览）；再否则退到 baseMaxZoom+1（海洋等，全球底图兜底）
+      // 需求 4 效果：可视范围跨上海(17)+江苏(13) → min(17,13)=13，整屏统一 z13 基准，无边界隔离断层；
+      //              放大到上海独占视图 → 省级相交只有上海 → min=17，上海 z14–17 高清瓦片正常加载 ✅
+      function getViewMinMaxZoom() {
+        const viewBounds = getCurrentViewBounds()
+        if (!viewBounds) return null
+        // 阶段一：遍历所有区域地图，收集【排除国家级】的省级/市级相交者的 min(maxZoom)
+        let provincialMinZ = null
+        // 同时记录国家级是否与视图相交（用于无省级时的兜底）
+        let nationalIntersects = false
+        for (const m of regionalMaps) {
+          if (!m.bounds) continue
+          if (!boundsIntersect(viewBounds, m.bounds)) continue
+          // ===== 核心：排除国家级概览地图（否则永远被其 maxZoom=9 压低） =====
+          if (nationalMap && m.id === nationalMap.id) {
+            nationalIntersects = true
+            continue
+          }
+          if (provincialMinZ === null || m.maxZoom < provincialMinZ) provincialMinZ = m.maxZoom
+        }
+        if (provincialMinZ !== null) {
+          return provincialMinZ // 至少一个省级/市级行政区覆盖 → 用它们的 min 做统一层级基准
+        }
+        // 阶段二：无省级/市级覆盖。若国家级覆盖视图 → 兜底国家级 maxZoom（保障 z6–9 概览瓦片仍请求）
+        if (nationalIntersects && nationalMap) {
+          return nationalMap.maxZoom
+        }
+        // 阶段三：海洋/极地等无任何行政区 → 默认 baseMaxZoom+1，由 base 层全球底图 client-stretch 兜底
+        return baseMaxZoom + 1
+      }
+
+      // ===== 鼠标按下区域识别与数据源加载 =====
+      // 找出包含指定经纬度的最具体行政区：bounds 面积最小者优先
+      // （嵌套场景上海 ⊂ 江苏时命中上海；无省级覆盖时命中国家级如中国；
+      //   返回 null 表示海域/无行政区数据区，由全球底图兜底）
+      function findRegionAtLonLat(lon, lat) {
+        let best = null
+        let bestArea = Infinity
+        for (const m of regionalMaps) {
+          if (!m.bounds) continue
+          const b = m.bounds
+          if (lon >= b.west && lon <= b.east && lat >= b.south && lat <= b.north) {
+            const area = mapBoundsArea(m)
+            if (area < bestArea) {
+              bestArea = area
+              best = m
+            }
+          }
+        }
+        return best
+      }
+
+      // 更新工具栏"所在区域"行：显示按下点所属行政区与数据层级范围
+      function updateRegionInfo(lon, lat) {
+        const el = document.getElementById('regionInfo')
+        if (!el) return
+        const region = findRegionAtLonLat(lon, lat)
+        if (region) {
+          el.textContent = `${region.name} (z${region.minZoom}~${region.maxZoom})`
+          el.style.color = '#188038'
+        } else if (globalMap) {
+          el.textContent = '无行政区数据（全球底图）'
+          el.style.color = '#b06000'
+        } else {
+          el.textContent = '无数据区域'
+          el.style.color = '#d93025'
+        }
+      }
+
+      // 按下未拖拽（singleclick）时加载按下点所在区域的数据源。
+      // 统一接口按层级自动选源（z≤5 全球 / z6-9 国家级 / z10+ 省级），
+      // "加载某区域数据源" = 飞行到按下点并进入该区域数据的接管层级：
+      //   - 省级/市级：目标层级 = min(区域.maxZoom, max(当前zoom, 国家级.maxZoom+1))
+      //     低层级（如 z6）按下时跳到省级接管层（z10 起），该区域瓦片开始加载；
+      //     已在接管层以上（如 z12 按下天津）则数据源本就是该区域，不动作
+      //   - 国家级（无省级数据的区域，如陕西）：目标层级 = min(maxZoom, max(当前, baseMaxZoom+1))
+      //   - 无行政区（海域等）：当前层级已由全球底图覆盖，不动作
+      function loadRegionDataSource(lon, lat) {
+        if (!olMap) return
+        const region = findRegionAtLonLat(lon, lat)
+        updateRegionInfo(lon, lat)
+        if (!region) return
+        const view = olMap.getView()
+        const currentZoom = view.getZoom()
+        let targetZoom
+        if (region === nationalMap) {
+          // 国家级数据在 baseMaxZoom+1 ~ nationalMap.maxZoom 接管（如 z6-9 中国）
+          targetZoom = Math.min(region.maxZoom, Math.max(currentZoom, baseMaxZoom + 1))
+        } else {
+          // 省级/市级从 nationalMap.maxZoom+1 接管（无国家级地图时退到 baseMaxZoom+1）
+          const floor = nationalMap ? nationalMap.maxZoom + 1 : baseMaxZoom + 1
+          targetZoom = Math.min(region.maxZoom, Math.max(currentZoom, floor))
+        }
+        // 只放大不缩小：已在该区域数据层级内时无需任何动作
+        if (targetZoom <= currentZoom) return
+        console.log(
+          `[region] 按下加载: ${region.name} -> z${targetZoom.toFixed(1)} @ (${lon.toFixed(3)}, ${lat.toFixed(3)})`
+        )
+        // 飞行动画：居中到按下点并进入该区域数据接管层级；
+        // 层级基准（detailMaxZoom）随 change:resolution 在动画过程中自动更新
+        view.animate({
+          center: ol.proj.fromLonLat([lon, lat]),
+          zoom: targetZoom,
+          duration: 700
+        })
+      }
+
+      // 根据"当前可视范围 intersect 所有区域（排除国家级）"的 min(maxZoom) 更新层级基准：
+      // - 整屏统一层级基准（需求 4：无隔离断层效果）
+      // - 超出该层级的瓦片由加载器层级闸门拦截（见 makeFetchTileLoader），
+      //   OL 自动客户端放大祖先瓦片（client-side overzoom），不发起新请求
+      // - 【常驻 source 方案】detail source 永不 setSource 换源（换源竞态曾致渲染管线
+      //   半死：tile 停 IDLE / canvas 消失 / 帧冻结 → 多层叠加与错位的根因），
+      //   基准变化只更新变量；仅"升档且当前视口正需要更高层"时对同一 source 对象
+      //   refresh()（清 tileCache，不换源对象，渲染管线全程稳定）
+      let detailRefreshTimer = null
+      function updateDetailMaxZoom() {
+        if (!detailLayer || regionalMaps.length === 0) return
+        const newMax = getViewMinMaxZoom()
+        if (newMax === null || newMax === detailMaxZoom) return
+        const prev = detailMaxZoom
+        detailMaxZoom = newMax
+        console.log(`[detail] 可视范围统一层级基准: z${prev} → z${newMax}`)
+        // 降档无需 refresh：已加载的高层瓦片继续有效显示，后续更高层请求由闸门自然拦截
+        // 升档 + 当前已放大到旧基准以上（正看祖先拉伸画面 / 高层 tile 已被闸门标记 ERROR 缓存）
+        // → 必须 refresh 清缓存，让这些瓦片重新走加载流程（闸门按新基准放行）
+        if (prev !== null && newMax > prev && detailSource && olMap) {
+          const tileZoom = Math.round(olMap.getView().getZoom())
+          if (tileZoom > prev) {
+            // 200ms 防抖：快速平移跨区域时收敛到最终基准再刷新，避免连续清缓存
+            clearTimeout(detailRefreshTimer)
+            detailRefreshTimer = setTimeout(() => {
+              try {
+                detailSource.refresh()
+              } catch (_) {
+                /* ignore */
+              }
+            }, 200)
+          }
+        }
+      }
+
+      // 最近瓦片错误计数（用于错误率统计与友好提示）
+      let recentTileErrors = 0
+      let recentTileTotal = 0
+      let errorToastCooldown = 0
+
+      // 从响应头读取数据源信息更新状态面板
+      // 关键：detail 层可见（opacity>0）时，由 detail 层瓦片更新源信息（反映当前可视的高清数据源）；
+      //       base 层瓦片仅在 detail 层不可见（低层级全球视图）时才更新，避免 base 的全球瓦片覆盖 detail 的省市源
+      function applySourceHeaders(headers, tag) {
+        try {
+          if (tag === 'base' && detailLayer && detailLayer.getVisible() && detailLayer.getOpacity() > 0) return
+          const mapId = headers.get('x-tile-source')
+          if (!mapId) return
+          const nameEnc = headers.get('x-tile-source-name')
+          const name = nameEnc ? decodeURIComponent(nameEnc) : mapId
+          const fallback = headers.get('x-tile-global-fallback') === 'true'
+          const badge = fallback ? '<span class="source-badge">global</span>' : ''
+          document.getElementById('sourceInfo').innerHTML = `${name} ${badge}`
+        } catch (e) {
+          /* ignore */
+        }
+      }
+
+      // 基于 fetch 的瓦片加载器：
+      // - 【层级闸门】detail 层瓦片 z 超出当前区域基准 detailMaxZoom 时，直接标记
+      //   TileState.ERROR 且不发任何请求 —— OL 渲染器自动用已缓存祖先瓦片客户端拉伸填充，
+      //   实现与 source.maxZoom 完全一致的整屏统一拉伸效果（这是常驻 source 方案的核心：
+      //   不换源就能动态控制请求层级上限，彻底规避 setSource 换源竞态）
+      // - 404 → 设置 TileState.ERROR（关键！OL 自动 fallback 到最近加载的祖先瓦片做客户端拉伸，
+      //         而非"透明瓦片盖掉祖先"——消除省际边界 gap、放大超出层级继续显示已加载内容）
+      // - 5xx/429/网络错误 → 指数退避重试（最多 2 次），仍失败则 Tile ERROR
+      // - 15s 强制结算：任何原因卡在 LOADING 的瓦片被强制标记 ERROR，防止加载计数永不清零
+      // - 成功 → 读取响应头 X-Tile-Source 等更新状态面板
+      // 关键：OL TileState.ERROR 渲染器会在 detail 层查找已缓存的低层级祖先瓦片并拉伸显示，
+      //       因此"放大超出基准"与"边界瓦片精确 z 缺失"都保持连续图像，不会出现白块/断层。
+      function makeFetchTileLoader(tag) {
+        const TileState = ol.TileState || { IDLE: 0, LOADING: 1, LOADED: 2, ERROR: 3, EMPTY: 4 }
+        return function (tile, src) {
+          // ===== 层级闸门（仅 detail 层）=====
+          // 闸门拦截属正常层级控制（非数据错误），不计入错误率统计
+          if (tag === 'detail' && detailMaxZoom !== null) {
+            let z = null
+            try {
+              z = tile.getTileCoord()[0]
+            } catch (_) {
+              const m = src.match(/\/tiles\/(\d+)\/\d+\/\d+\.png/)
+              if (m) z = parseInt(m[1], 10)
+            }
+            if (z !== null && z !== undefined && z > detailMaxZoom) {
+              try {
+                tile.setState(TileState.ERROR)
+              } catch (_) {
+                /* ignore */
+              }
+              // 闸门拦截同样触发祖先补载：跳变到超基准层级（如 z8→z16）时
+              // 基准层级瓦片（z15）从未加载，链断会透出白块；补载后渲染器拉伸 z15 瓦片显示
+              prefetchAncestorTile(tile)
+              return // 不发请求，loadingCount 由 tileloadstart/tileloaderror 事件对冲平衡
+            }
+          }
+
+          const img = tile.getImage()
+          let settled = false
+          let attempts = 0
+          const MAX_RETRY = 2
+
+          // 15s 强制结算：防 LOADING 卡死（网络挂起 / blob 未触发 onload 等），
+          // 超时后强制 ERROR，保证 loadingCount 最终归零、渲染不冻结
+          const timeoutId = setTimeout(() => markTileError('timeout'), 15000)
+
+          // 记录瓦片加载事件（tileloadstart 已由 bindSourceEvents 处理）
+          function recordStat(reason) {
+            recentTileTotal++
+            // 404 属正常层级边界（由祖先 fallback 接管），不计入异常错误率
+            if (reason !== '404') recentTileErrors++
+            maybeWarnSparseData()
+          }
+
+          function markTileError(reason) {
+            if (settled) return
+            settled = true
+            clearTimeout(timeoutId)
+            recordStat(reason)
+            img.onload = null
+            img.onerror = null
+            // 核心：设置 TileState.ERROR，OL 渲染器会自动用已缓存的祖先瓦片拉伸填充该格子
+            // （若 detail 层尚无祖先缓存，则该格透明透出 base 层全球底图——比透明盖图视觉一致）
+            try {
+              tile.setState(TileState.ERROR)
+            } catch (e) {
+              // 兼容降级：清空 src，由 OL 内部错误处理链兜底
+              try {
+                img.removeAttribute('src')
+              } catch (_) {
+                /* ignore */
+              }
+            }
+            // ===== 祖先链补载（ancestral prefetch）=====
+            // 404 时把 z-1 祖先瓦片主动拉进 source 缓存：
+            // OL renderFrame 对 ERROR 格子会沿 forEachTileCoordParentTileRange 逐级向上找
+            // "已缓存 LOADED" 的祖先拉伸绘制；但缩放跳变（如 z8→z11）时中间层从未加载，
+            // 祖先链断裂 → ERROR 格子透出 base 层全球海洋瓦片（放大数十倍后的"白块"）。
+            // 补一级祖先后：祖先 LOADED → 渲染器自动命中绘制；
+            // 祖先也 404 → 其自身 markTileError 递归触发上一级，天然逐级向上（止于 detail 层 minZoom）。
+            // 相邻 ERROR 格子共享祖先瓦片（4 格共享 z-1、16 格共享 z-2），
+            // 且 tileCache 命中不会重复请求 → 实际新增请求量极小。
+            if (reason === '404' && tag === 'detail') {
+              prefetchAncestorTile(tile)
+            }
+          }
+
+          function load() {
+            fetch(src, { mode: 'cors', credentials: 'omit' })
+              .then((res) => {
+                if (res.status === 404) {
+                  markTileError('404')
+                  return null
+                }
+                if (res.status >= 500 || res.status === 429) {
+                  throw new Error('server ' + res.status)
+                }
+                if (!res.ok) {
+                  markTileError('status' + res.status)
+                  return null
+                }
+                applySourceHeaders(res.headers, tag)
+                return res.blob()
+              })
+              .then((blob) => {
+                if (!blob) return
+                const url = URL.createObjectURL(blob)
+                img.onload = function () {
+                  URL.revokeObjectURL(url)
+                  if (!settled) {
+                    settled = true
+                    clearTimeout(timeoutId)
+                    recentTileTotal++
+                  }
+                }
+                img.onerror = function () {
+                  URL.revokeObjectURL(url)
+                  markTileError('decode')
+                }
+                img.src = url
+              })
+              .catch(() => {
+                // 网络错误或服务端 5xx：指数退避重试
+                attempts++
+                if (attempts <= MAX_RETRY) {
+                  setTimeout(load, 300 * attempts)
+                } else {
+                  markTileError('network')
+                }
+              })
+          }
+          load()
+        }
+      }
+
+      // 祖先链补载：把 ERROR 格子的 z-1 祖先瓦片主动拉进 detail source 缓存。
+      // 依赖常驻 source 方案（对象永不更换，闭包引用安全）：
+      // - source.getTile(az,...) cache 命中直接返回（不重复请求），否则创建并触发正常加载流程
+      // - 祖先 LOADED → tileloadend → source.changed() → 重绘 → 渲染器祖先回退命中该瓦片
+      // - 祖先也 404 → 其加载器 markTileError('404') 递归调用本函数补更上一级（止于 detail 层 minZoom）
+      // - pixelRatio 传 1：XYZ 瓦片 URL 不含 pixelRatio，与渲染器请求命中同一 cache 条目
+      function prefetchAncestorTile(tile) {
+        try {
+          if (!olMap || !detailSource) return
+          const coord = tile.getTileCoord()
+          if (!coord) return
+          const tz = coord[0]
+          const az = tz - 1
+          const minZ = baseMaxZoom + 1 // z ≤ baseMaxZoom 由 base 层全球底图负责，不越界
+          if (az < minZ) return
+          const ax = Math.floor(coord[1] / 2)
+          const ay = Math.floor(coord[2] / 2)
+          const proj = olMap.getView().getProjection()
+          detailSource.getTile(az, ax, ay, 1, proj)
+        } catch (_) {
+          /* ignore */
+        }
+      }
+
+      // 错误率超阈值时提示用户当前区域数据稀疏（含防抖，5s 内只提示一次）
+      function maybeWarnSparseData() {
+        if (recentTileTotal < 10) return
+        let rate = recentTileErrors / recentTileTotal
+        // 滑动窗口：保留最近 30 次
+        if (recentTileTotal > 30) {
+          recentTileErrors = Math.round(recentTileErrors * (30 / recentTileTotal))
+          recentTileTotal = 30
+          rate = recentTileErrors / recentTileTotal
+        }
+        const now = Date.now()
+        if (rate > 0.6 && now - errorToastCooldown > 5000) {
+          errorToastCooldown = now
+          showError('当前区域瓦片数据较少，部分位置显示底图放大效果')
+        }
+      }
+
+      // 检测是否已进入全球视图（低层级缩放 + 存在全球地图）
+      function checkGlobalView() {
+        if (!globalMap) return // 无全球地图资源时维持当前显示状态
+        const currentZoom = olMap.getView().getZoom()
+        // 当前 zoom ≤ 全球地图 maxZoom 时视为全球视图
+        // （直接命中 [minZoom, maxZoom] 或 underzoom z<minZoom 均显示全球地图）
+        if (currentZoom <= globalMap.maxZoom) {
+          if (!globalViewNotified) {
+            globalViewNotified = true
+            const mode =
+              currentZoom < globalMap.minZoom ? `underzoom@z${globalMap.minZoom}` : `z=${Math.round(currentZoom)}`
+            showError(`全球地图视图 (${mode})`, 4000)
+            statusInfo.textContent = `全球视图 (${mode})`
+            statusInfo.style.color = '#1e8e3e'
+          }
+        } else {
+          // 缩放回升至全球地图 maxZoom 以上，切换回区域视图
+          if (globalViewNotified && currentZoom >= globalMap.maxZoom + 0.5) {
+            globalViewNotified = false
+            statusInfo.textContent = '就绪'
+            statusInfo.style.color = '#1a73e8'
+          }
+        }
+      }
+
+      // 检测是否已达到/超过当前区域最大层级，首次跨越时提示
+      // 使用 detailMaxZoom（按区域动态）而非全局 maxDataZoom，
+      // 使提示与当前区域实际可用层级一致（如江苏 z13、上海 z17）
+      function checkMaxZoomReached() {
+        if (detailMaxZoom === null) return
+        const currentZoom = olMap.getView().getZoom()
+        if (currentZoom > detailMaxZoom) {
           if (!maxZoomNotified) {
             maxZoomNotified = true
-            showError(`已达到数据源最大层级 z=${maxDataZoom}，继续放大将使用 overzoom 放大显示（图像会变模糊）`, 6000)
+            showError(`当前区域最大层级 z=${detailMaxZoom}，继续放大将放大当前图片显示（图像会变模糊）`, 6000)
             // 更新状态面板徽标
-            statusInfo.textContent = `已超最大层级 (overzoom)`
+            statusInfo.textContent = `已超区域最大层级 (放大显示)`
             statusInfo.style.color = '#b06000'
           }
         } else {
           // 缩回最大层级以内，重置标记，允许下次再次提示
-          if (maxZoomNotified && currentZoom <= maxDataZoom - 0.5) {
+          if (maxZoomNotified && currentZoom <= detailMaxZoom - 0.5) {
             maxZoomNotified = false
           }
         }
       }
 
+      // 重入守卫：防止 init 被重复调用或框架重复渲染时多层叠加
+      let _isSwitching = false
       function switchToUnifiedLayer() {
-        if (currentLayer) {
-          olMap.removeLayer(currentLayer)
+        if (_isSwitching) {
+          console.warn('[switchToUnifiedLayer] 切换进行中，跳过重复调用')
+          return
         }
+        _isSwitching = true
+        // ===== 【关键修复：先加新层 → 再删旧层，杜绝"0 图层灾难"】=====
+        // 原实现"先 removeLayer(旧层)→removeLayer(旧层)→构建→addLayer→addLayer"
+        // 若中间任一步骤抛异常（如 new XYZ 参数异常、getViewMinMaxZoom 内部访问 null 等），
+        // 地图图层数组永远保持空数组（0 层）！
+        // → 后果：OL 永远不会重绘 canvas，但 view.getCenter() 仍会随程序 setCenter 更新，
+        //   导致【右图异常】：status 显示"中心=天津(116.89,39.12)"，但 canvas 仍残留
+        //   之前渲染的上海画面（两者相差 1000+ km）；右/下边缘瓦片无图层填充 → 大片空白。
+        //
+        // 新策略：任何时刻 olMap 图层数 ≥ 1（有旧层或新层在），永不归零：
+        //   1. 构建 NEW 图层局部变量（不触碰全局 baseLayer/detailLayer）
+        //   2. 把 NEW 图层 ADD 到 olMap（短暂 2~4 层叠加：旧 base+新 base+旧 detail+新 detail）
+        //   3. 监听下一次 postrender 后 REMOVE 旧层（用户几乎感知不到叠加态）
+        //   4. setTimeout 300ms 兜底删除（防止 postrender 因 view.size=0 等不触发，旧层永久挂在）
+        //   5. 全局变量最后才赋值（新层全部就绪后）
+        //   6. 整个流程 try/catch：异常时回滚已添加的 NEW 半吊子层，旧层不动
+        const oldBase = baseLayer
+        const oldDetail = detailLayer
+        let newBaseSrc = null,
+          newBase = null
+        let newDetailSrc = null,
+          newDetail = null,
+          newDetailMax = null
+        let rollbackAdded = [] // 记录本函数内已 addLayer 的对象，catch 时回滚用
 
-        currentSource = new ol.source.XYZ({
-          url: UNIFIED_TILE_URL,
-          // 关键：限制 source 的 maxZoom 为数据源最大级别，
-          // 超过时 OL 会自动放大显示现有瓦片，而非请求新瓦片，
-          // 避免服务端 overzoom 返回同一张父瓦片导致满屏重复
-          maxZoom: maxDataZoom !== null ? maxDataZoom : 18,
-          crossOrigin: 'anonymous',
-          transition: 200
-        })
+        try {
+          // ===== 新底图层：全球低层级视图 =====
+          newBaseSrc = new ol.source.XYZ({
+            url: UNIFIED_TILE_URL,
+            maxZoom: baseMaxZoom,
+            minZoom: globalMap ? globalMap.minZoom : 0,
+            crossOrigin: 'anonymous',
+            transition: 500,
+            opaque: true,
+            cacheSize: 256,
+            tileLoadFunction: makeFetchTileLoader('base')
+          })
+          bindSourceEvents(newBaseSrc, 'base')
+          newBase = new ol.layer.Tile({
+            source: newBaseSrc,
+            preload: Infinity,
+            className: 'base-tile-layer'
+          })
 
-        // 监听瓦片加载状态
-        currentSource.on('tileloadstart', () => {
-          loadingCount++
-          errorCount = 0
-          showLoading()
-        })
-        currentSource.on('tileloadend', (evt) => {
-          loadingCount = Math.max(0, loadingCount - 1)
-          // 从响应头读取数据源信息
-          readTileSourceInfo(evt)
-          hideLoading()
-        })
-        currentSource.on('tileloaderror', (evt) => {
-          loadingCount = Math.max(0, loadingCount - 1)
-          errorCount++
-          hideLoading()
-          // 统一接口对无数据区域返回 404 属于正常情况，仅当大量失败时提示
-          if (errorCount > 5) {
-            showError('部分瓦片加载失败，可能当前区域无数据')
+          // ===== 新详情层：区域高层级视图（source 常驻，永不换源）=====
+          if (maxDataZoom !== null && maxDataZoom > baseMaxZoom) {
+            // 常驻方案：source.maxZoom 固定为全局最大数据层级（如 17），
+            // 运行期由加载器层级闸门按动态基准 detailMaxZoom 拦截超层请求。
+            // 初始基准取乐观值 maxDataZoom（放行所有请求）：
+            //   map 创建后尚未渲染时 size=[0,0]，getViewMinMaxZoom 结果不可信（误算成
+            //   baseMaxZoom+1=6）。URL 直接定位到高 zoom（如 ?zoom=7.5）时 detail 层第一帧
+            //   即可见，保守初始值会让第一帧瓦片被层级闸门拦截成 ERROR，postrender 升档
+            //   又触发 refresh() abort 进行中请求 → 部分瓦片永久缺失（视口空白）。
+            //   乐观初始值保证第一帧请求全部放行；postrender 后 updateDetailMaxZoom
+            //   立即降档到真实基准（降档不 refresh、无副作用，已加载瓦片继续显示）。
+            newDetailMax = maxDataZoom
+            newDetailSrc = new ol.source.XYZ({
+              url: UNIFIED_TILE_URL,
+              minZoom: baseMaxZoom + 1,
+              maxZoom: maxDataZoom,
+              crossOrigin: 'anonymous',
+              transition: 500,
+              opaque: false,
+              cacheSize: 512,
+              tileLoadFunction: makeFetchTileLoader('detail')
+            })
+            bindSourceEvents(newDetailSrc, 'detail')
+            newDetail = new ol.layer.Tile({
+              source: newDetailSrc,
+              preload: 1,
+              className: 'detail-tile-layer'
+            })
           }
-        })
 
-        currentLayer = new ol.layer.Tile({ source: currentSource })
-        olMap.addLayer(currentLayer)
+          // ====== 关键：先添加新层（此步之后图层数 2~4，画面有内容永不空） ======
+          olMap.addLayer(newBase)
+          rollbackAdded.push(newBase)
+          if (newDetail) {
+            olMap.addLayer(newDetail)
+            rollbackAdded.push(newDetail)
+          }
+
+          // ====== 后删除旧层：等新层第一帧 postrender 完成后删除（避免用户见叠加闪烁） ======
+          const removeOldLayersSafely = () => {
+            try {
+              const currentLayers = olMap.getLayers().getArray()
+              if (oldBase && currentLayers.includes(oldBase)) olMap.removeLayer(oldBase)
+              if (oldDetail && currentLayers.includes(oldDetail)) olMap.removeLayer(oldDetail)
+            } catch (_) {
+              /* ignore */
+            }
+          }
+          // postrender 触发：新图层第一帧像素已上屏 → 此时删旧层无感知空白
+          olMap.once('postrender', removeOldLayersSafely)
+          // 300ms 兜底删除（view.size=0 / 无数据 / 网络异常等可能导致 postrender 永不触发）
+          setTimeout(removeOldLayersSafely, 300)
+
+          // ====== 全部流程无异常 → 最后赋值全局变量 ======
+          baseSource = newBaseSrc
+          baseLayer = newBase
+          detailSource = newDetailSrc
+          detailLayer = newDetail
+          // 兜底同样取乐观值 maxDataZoom（理由同上：避免首帧闸门拦截 + 升档 refresh 竞态）
+          detailMaxZoom = newDetailMax !== null ? newDetailMax : maxDataZoom
+          currentLayer = detailLayer || baseLayer
+          currentSource = detailSource || baseSource
+
+          // 初始化 detail 层透明度（基于当前 zoom）
+          updateLayerOpacity()
+        } catch (e) {
+          console.error('[switchToUnifiedLayer] 创建新图层失败：', e)
+          showError('地图图层构建失败，已自动回滚到上一个可用图层。错误：' + (e.message || e), 6000)
+          // ===== 回滚：删除本函数已添加到 olMap 的半吊子 NEW 层 =====
+          // （旧层从未被移除，继续显示，保证用户仍能看到地图 → 图层数 = 1~2，永不空）
+          try {
+            const currentLayers = olMap.getLayers().getArray()
+            for (const added of rollbackAdded) {
+              if (currentLayers.includes(added)) olMap.removeLayer(added)
+            }
+          } catch (_) {
+            /* ignore */
+          }
+          // 全局变量继续指向旧层（new 值丢弃）
+          // 若旧层本身为 null（首次 init 异常），地图仍有其他层，用户不白屏
+        } finally {
+          _isSwitching = false
+        }
       }
 
-      // 从瓦片响应头读取数据源信息（用于状态面板展示）
-      function readTileSourceInfo(evt) {
-        try {
-          const tile = evt && evt.tile
-          if (!tile) return
-          const img = tile.getImage && tile.getImage()
-          // OpenLayers 内部不直接暴露响应头，这里通过 Image 加载无 header 访问能力，
-          // 改用轮询 /health 接口获取地图列表展示基本信息即可。
-        } catch (e) {
-          // 忽略
-        }
+      // 统一绑定瓦片加载事件（base 与 detail 共用）
+      // 注：加载器中所有失败路径（404/网络/超时/闸门拦截）都通过 setState(ERROR) 结算，
+      //     此处 tileloaderror 仅对冲 loadingCount；错误率统计完全由加载器 recordStat 负责
+      //     （闸门拦截属正常层级控制，绝不能计入错误率 → 避免误报"数据稀疏"）
+      function bindSourceEvents(source, tag) {
+        source.on('tileloadstart', () => {
+          loadingCount++
+          showLoading()
+        })
+        source.on('tileloadend', () => {
+          loadingCount = Math.max(0, loadingCount - 1)
+          hideLoading()
+        })
+        source.on('tileloaderror', () => {
+          // 仅对冲加载计数；错误统计已由加载器 markTileError→recordStat 精确记录
+          loadingCount = Math.max(0, loadingCount - 1)
+          hideLoading()
+        })
       }
 
       // 更新缩放级别显示：同时展示浮点 zoom 与实际瓦片整数级别
@@ -290,10 +987,23 @@
         const tileZoom = Math.round(floatZoom)
         const zoomInfo = document.getElementById('zoomInfo')
 
-        if (maxDataZoom !== null && tileZoom > maxDataZoom) {
-          // 已超过数据源最大级别，OL 正在放大显示 maxZoom 处的瓦片
-          const overLevels = (floatZoom - maxDataZoom).toFixed(1)
-          zoomInfo.innerHTML = `${floatZoom.toFixed(2)} <span style="color:#b06000;font-size:11px">(数据 z=${maxDataZoom}, 放大 ${overLevels}级)</span>`
+        if (detailMaxZoom !== null && tileZoom > detailMaxZoom) {
+          // 已超过当前区域最大级别，OL 正在客户端放大显示 maxZoom 处的瓦片
+          const overLevels = (floatZoom - detailMaxZoom).toFixed(1)
+          zoomInfo.innerHTML = `${floatZoom.toFixed(2)} <span style="color:#b06000;font-size:11px">(数据 z=${detailMaxZoom}, 放大 ${overLevels}级)</span>`
+        } else if (globalMap && tileZoom <= globalMap.maxZoom) {
+          // 在全球地图范围内（直接命中或 underzoom）
+          if (tileZoom < globalMap.minZoom) {
+            // underzoom：z < minZoom，服务端回退到 minZoom
+            const underLevels = (globalMap.minZoom - floatZoom).toFixed(1)
+            zoomInfo.innerHTML = `${floatZoom.toFixed(2)} <span style="color:#1e8e3e;font-size:11px">(全球 z=${globalMap.minZoom}, 缩小 ${underLevels}级)</span>`
+          } else {
+            // 直接命中全球地图
+            zoomInfo.innerHTML = `${floatZoom.toFixed(2)} <span style="color:#1e8e3e;font-size:11px">(全球 z=${tileZoom})</span>`
+          }
+        } else if (minDataZoom !== null && tileZoom < minDataZoom) {
+          // 低于所有数据源最小级别且无全球地图，维持当前视图
+          zoomInfo.innerHTML = `${floatZoom.toFixed(2)} <span style="color:#666;font-size:11px">(低于最小层级 z=${minDataZoom}, 维持显示)</span>`
         } else {
           // 正常范围：显示浮点 zoom + 实际瓦片级别
           zoomInfo.innerHTML = `${floatZoom.toFixed(2)} <span style="color:#666;font-size:11px">(瓦片 z=${tileZoom})</span>`
