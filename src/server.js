@@ -48,6 +48,8 @@ app.get('/health', (req, res) => {
 // 根路径 URL 重写：访问 / 时直接返回 openlayers.html 内容，
 // 浏览器地址栏保持 http://localhost:3000/ 不变
 app.get('/', (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate')
+  res.setHeader('Pragma', 'no-cache')
   res.sendFile(path.join(__dirname, '../examples/openlayers.html'))
 })
 
